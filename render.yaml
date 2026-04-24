@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: free4talk-keeper
+    env: node
+    plan: free
+    buildCommand: npm install && PLAYWRIGHT_BROWSERS_PATH=./browsers node node_modules/playwright/cli.js install chromium
+    startCommand: node index.js
+    envVars:
+      - key: ROOM_URL
+        value: https://www.free4talk.com/room/vc666?key=694049
+      - key: LS_USER_TOKEN
+        sync: false
+      - key: LS_USER_NAME
+        sync: false
+      - key: LS_USER_LFP
+        sync: false
+      - key: LS_USER_REDIRECT
+        sync: false
+      - key: LS_KEYPAIR
+        sync: false
+      - key: LS_USER
+        sync: false

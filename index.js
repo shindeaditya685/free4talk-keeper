@@ -1,0 +1,322 @@
+const { chromium } = require("playwright");
+const express = require("express");
+const path = require("path");
+require("dotenv").config();
+
+// Point Playwright to browsers installed in project dir (installed during build)
+process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(__dirname, "browsers");
+
+// ── Config ──
+const ROOM_URL = process.env.ROOM_URL || null;
+const PORT = process.env.PORT || 3000;
+const LS_USER_TOKEN = process.env.LS_USER_TOKEN || null;
+const LS_USER_NAME = process.env.LS_USER_NAME || null;
+const LS_USER_LFP = process.env.LS_USER_LFP || null;
+const LS_USER_REDIRECT = process.env.LS_USER_REDIRECT || null;
+const LS_KEYPAIR = process.env.LS_KEYPAIR || null;
+const LS_USER = process.env.LS_USER || null;
+
+const HEALTH_CHECK_INTERVAL = 3 * 60 * 1000;
+const SAFE_RELOAD_INTERVAL = 18 * 60 * 1000;
+const RESTART_DELAY = 15000;
+const MAX_RESTART_ATTEMPTS = 50;
+
+const startTime = Date.now();
+let restartCount = 0;
+let isShuttingDown = false;
+let currentPage = null;
+let currentBrowser = null;
+
+// ── Express (starts IMMEDIATELY — must bind port fast for Render) ──
+const app = express();
+app.get("/", (req, res) => {
+  res.send(`<h2>Free4Talk Keeper</h2><p>Room: ${ROOM_URL}</p><p>Uptime: ${elapsed()}</p><p>Restarts: ${restartCount}</p>`);
+});
+app.listen(PORT, () => console.log(`[Server] Port ${PORT} ready`));
+
+// ── Helpers ──
+function elapsed() {
+  const ms = Date.now() - startTime;
+  return `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
+}
+
+function checkTokenExpiry() {
+  try {
+    const tokenObj = JSON.parse(LS_USER_TOKEN);
+    const payload = JSON.parse(Buffer.from(tokenObj.data.split(".")[1], "base64url").toString());
+    const hoursLeft = (new Date(payload.exp * 1000) - new Date()) / 3600000;
+    if (hoursLeft < 0) { console.error(`[Keeper] TOKEN EXPIRED!`); return "expired"; }
+    if (hoursLeft < 2) { console.warn(`[Keeper] Token expires in ${hoursLeft.toFixed(1)}h`); return "warning"; }
+    console.log(`[Keeper] Token OK - ${hoursLeft.toFixed(1)}h remaining`);
+    return "ok";
+  } catch { return "unknown"; }
+}
+
+// ── Build storageState with auth tokens (tokens exist BEFORE any page loads) ──
+function buildStorageState() {
+  return {
+    cookies: [
+      // www.free4talk.com cookies
+      {
+        name: "user_token",
+        value: LS_USER_TOKEN || "",
+        domain: ".free4talk.com",
+        path: "/",
+        httpOnly: false,
+        secure: true,
+        sameSite: "Lax"
+      },
+      {
+        name: "user_name",
+        value: LS_USER_NAME || "",
+        domain: ".free4talk.com",
+        path: "/",
+        httpOnly: false,
+        secure: true,
+        sameSite: "Lax"
+      }
+    ],
+    origins: [
+      {
+        origin: "https://www.free4talk.com",
+        localStorage: [
+          { name: "user:token", value: LS_USER_TOKEN || "" },
+          { name: "user_name", value: LS_USER_NAME || "" },
+          { name: "user:lfp", value: LS_USER_LFP || "" },
+          { name: "user:redirect", value: LS_USER_REDIRECT || "" }
+        ]
+      },
+      {
+        origin: "https://identity.free4talk.com",
+        localStorage: [
+          { name: "user", value: LS_USER || "" },
+          { name: "key-pair", value: LS_KEYPAIR || "" }
+        ]
+      }
+    ]
+  };
+}
+
+// ── Click to join room ──
+async function clickToJoin(page) {
+  // Free4Talk shows "Click on anywhere to start"
+  try {
+    const el = page.locator("text=Click on anywhere to start").first();
+    if (await el.isVisible({ timeout: 5000 })) {
+      await el.click();
+      console.log("[Keeper] Clicked 'Click on anywhere to start'");
+      await page.waitForTimeout(5000);
+      return true;
+    }
+  } catch {}
+  // Fallback: click center of page
+  try {
+    await page.mouse.click(400, 300);
+    console.log("[Keeper] Clicked page center (fallback)");
+    await page.waitForTimeout(5000);
+    return true;
+  } catch {}
+  return false;
+}
+
+// ── Health check ──
+async function isStillInRoom(page) {
+  try {
+    if (page.url().includes("login") || page.url().includes("signin")) return false;
+    const title = await page.title();
+    const ok = await page.evaluate(() => !!document.body && document.body.children.length > 0);
+    if (!ok || !title) return false;
+    const text = (await page.evaluate(() => document.body?.innerText?.substring(0, 2000) || "")).toLowerCase();
+    for (const kw of ["left the room", "disconnected", "reconnect", "connection lost"]) {
+      if (text.includes(kw)) return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+async function safeCleanup() {
+  try { if (currentBrowser) await currentBrowser.close().catch(() => {}); } catch {}
+  currentBrowser = null;
+  currentPage = null;
+}
+
+// ── Main ──
+async function joinRoom() {
+  if (isShuttingDown) return;
+  if (restartCount >= MAX_RESTART_ATTEMPTS) { console.error("[Keeper] Max restarts reached."); return; }
+
+  restartCount++;
+  console.log(`\n[Keeper] === Start #${restartCount} | ${elapsed()} ===`);
+  checkTokenExpiry();
+
+  try {
+    console.log("[Keeper] Launching browser...");
+    currentBrowser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+        "--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
+        "--disable-gpu", "--disable-extensions", "--disable-software-rasterizer",
+        "--disable-features=VizDisplayCompositor", "--disable-blink-features=AutomationControlled",
+      ],
+    });
+
+    // Create context with pre-loaded auth tokens (localStorage + cookies)
+    const storageState = buildStorageState();
+    const context = await currentBrowser.newContext({
+      permissions: ["microphone"],
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+      bypassCSP: true,
+      storageState: storageState,
+    });
+
+    // Re-inject auth on EVERY page load (runs before SPA code)
+    await context.addInitScript(({ token, name, lfp, redirect, user, keypair }) => {
+      // www.free4talk.com tokens
+      try {
+        if (token) localStorage.setItem("user:token", token);
+        if (name) localStorage.setItem("user_name", name);
+        if (lfp) localStorage.setItem("user:lfp", lfp);
+        if (redirect) localStorage.setItem("user:redirect", redirect);
+      } catch (e) { console.error("Auth inject (www) failed:", e); }
+
+      // identity.free4talk.com tokens
+      try {
+        if (user) localStorage.setItem("user", user);
+        if (keypair) localStorage.setItem("key-pair", keypair);
+      } catch (e) { console.error("Auth inject (identity) failed:", e); }
+    }, {
+      token: LS_USER_TOKEN,
+      name: LS_USER_NAME,
+      lfp: LS_USER_LFP,
+      redirect: LS_USER_REDIRECT,
+      user: LS_USER,
+      keypair: LS_KEYPAIR,
+    });
+
+    // Anti-detection
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, "webdriver", { get: () => false });
+      window.chrome = { runtime: {} };
+      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+    });
+
+    const page = await context.newPage();
+    currentPage = page;
+    page.on("pageerror", (err) => console.error(`[Keeper] Page error: ${err.message}`));
+
+    console.log(`[Keeper] Navigating to ${ROOM_URL}`);
+    await page.goto(ROOM_URL, { waitUntil: "networkidle", timeout: 60000 });
+    console.log(`[Keeper] Page loaded: ${page.url()}`);
+
+    // Wait for SPA to fully render
+    console.log("[Keeper] Waiting for page to render...");
+    await page.waitForTimeout(8000);
+
+    // Diagnostic: dump auth state
+    const authCheck = await page.evaluate(() => {
+      const token = localStorage.getItem("user:token");
+      const name = localStorage.getItem("user_name");
+      const lfp = localStorage.getItem("user:lfp");
+      return {
+        hasToken: !!token,
+        tokenPrefix: token ? token.substring(0, 30) + "..." : "NONE",
+        userName: name,
+        hasLfp: !!lfp
+      };
+    }).catch(() => ({ hasToken: false, tokenPrefix: "ERROR" }));
+    console.log(`[Keeper] Auth check: token=${authCheck.hasToken} (${authCheck.tokenPrefix}) name=${authCheck.userName} lfp=${authCheck.hasLfp}`);
+
+    // Dump page text
+    const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 800) || "");
+    console.log(`[Keeper] Page text: "${pageText.replace(/\n/g, ' ').substring(0, 200)}"`);
+
+    // Check for auth failure
+    if (pageText.toLowerCase().includes("sign in") || pageText.toLowerCase().includes("please sign")) {
+      console.error("[Keeper] AUTH FAILURE - page shows sign-in prompt");
+    }
+
+    // Click to join
+    console.log("[Keeper] Attempting to join...");
+    await clickToJoin(page);
+
+    // Wait for room connection
+    await page.waitForTimeout(10000);
+
+    const finalText = await page.evaluate(() => document.body?.innerText?.substring(0, 800) || "");
+    console.log(`[Keeper] After join: "${finalText.replace(/\n/g, ' ').substring(0, 200)}"`);
+
+    if (page.url().includes("login") || page.url().includes("signin")) {
+      console.error("[Keeper] Redirected to login!");
+      await safeCleanup();
+      return;
+    }
+    console.log(`[Keeper] In room: ${page.url()}`);
+    restartCount = 0;
+
+    // Health check loop
+    startHealthChecks(page);
+
+  } catch (err) {
+    console.error(`[Keeper] Fatal: ${err.message}`);
+    await safeCleanup();
+    setTimeout(() => joinRoom(), RESTART_DELAY);
+  }
+}
+
+function startHealthChecks(page) {
+  const healthInterval = setInterval(async () => {
+    if (isShuttingDown) { clearInterval(healthInterval); if (page._safeInterval) clearInterval(page._safeInterval); return; }
+    try {
+      if (await isStillInRoom(page)) {
+        console.log(`[Keeper] Health OK | ${elapsed()}`);
+      } else {
+        console.warn("[Keeper] Unhealthy - reloading...");
+        clearInterval(healthInterval); if (page._safeInterval) clearInterval(page._safeInterval);
+        try {
+          await page.reload({ waitUntil: "networkidle", timeout: 60000 });
+          await page.waitForTimeout(8000);
+          await clickToJoin(page);
+          await page.waitForTimeout(10000);
+          console.log("[Keeper] Recovered");
+          startHealthChecks(page);
+        } catch (err) {
+          console.error(`[Keeper] Recovery failed: ${err.message}`);
+          await safeCleanup();
+          setTimeout(() => joinRoom(), RESTART_DELAY);
+        }
+      }
+    } catch (err) {
+      clearInterval(healthInterval); if (page._safeInterval) clearInterval(page._safeInterval);
+      await safeCleanup();
+      setTimeout(() => joinRoom(), RESTART_DELAY);
+    }
+  }, HEALTH_CHECK_INTERVAL);
+
+  const safeInterval = setInterval(async () => {
+    if (isShuttingDown) { clearInterval(safeInterval); return; }
+    try {
+      console.log(`[Keeper] Safety reload | ${elapsed()}`);
+      await page.reload({ waitUntil: "networkidle", timeout: 60000 });
+      await page.waitForTimeout(8000);
+      await clickToJoin(page);
+    } catch (err) {
+      clearInterval(healthInterval); clearInterval(safeInterval);
+      await safeCleanup();
+      setTimeout(() => joinRoom(), RESTART_DELAY);
+    }
+  }, SAFE_RELOAD_INTERVAL);
+
+  page._healthInterval = healthInterval;
+  page._safeInterval = safeInterval;
+}
+
+// ── Graceful shutdown ──
+process.on("SIGINT", async () => { isShuttingDown = true; console.log(`Shutting down. ${elapsed()}`); await safeCleanup(); process.exit(0); });
+process.on("SIGTERM", async () => { isShuttingDown = true; await safeCleanup(); process.exit(0); });
+process.on("uncaughtException", async (err) => { console.error(`Crash: ${err.message}`); await safeCleanup(); if (!isShuttingDown) setTimeout(() => joinRoom(), RESTART_DELAY); });
+process.on("unhandledRejection", async (r) => { console.error(`Crash: ${r}`); await safeCleanup(); if (!isShuttingDown) setTimeout(() => joinRoom(), RESTART_DELAY); });
+
+// ── Start bot (Express is already listening above) ──
+joinRoom();
