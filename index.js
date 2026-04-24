@@ -1,7 +1,7 @@
 const path = require("path");
 require("dotenv").config();
 
-// MUST be set BEFORE requiring playwright — it reads this env var at require time
+// MUST be set BEFORE requiring playwright
 process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(__dirname, "browsers");
 
 const { chromium } = require("playwright");
@@ -27,6 +27,7 @@ let restartCount = 0;
 let isShuttingDown = false;
 let currentPage = null;
 let currentBrowser = null;
+let currentContext = null;
 
 // ── Express (starts IMMEDIATELY — must bind port fast for Render) ──
 const app = express();
@@ -51,7 +52,7 @@ function checkTokenExpiry() {
     );
     const hoursLeft = (new Date(payload.exp * 1000) - new Date()) / 3600000;
     if (hoursLeft < 0) {
-      console.error(`[Keeper] TOKEN EXPIRED!`);
+      console.error("[Keeper] TOKEN EXPIRED!");
       return "expired";
     }
     if (hoursLeft < 2) {
@@ -65,54 +66,58 @@ function checkTokenExpiry() {
   }
 }
 
-// ── Build storageState with auth tokens (tokens exist BEFORE any page loads) ──
-function buildStorageState() {
-  return {
-    cookies: [
-      // www.free4talk.com cookies
-      {
-        name: "user_token",
-        value: LS_USER_TOKEN || "",
-        domain: ".free4talk.com",
-        path: "/",
-        httpOnly: false,
-        secure: true,
-        sameSite: "Lax",
+// ── Inject www.free4talk.com tokens via page.evaluate (direct, reliable) ──
+async function injectTokens(page) {
+  const result = await page.evaluate(
+    ({ token, name, lfp, redirect }) => {
+      try {
+        localStorage.setItem("user:token", token);
+        localStorage.setItem("user_name", name);
+        localStorage.setItem("user:lfp", lfp);
+        localStorage.setItem("user:redirect", redirect);
+        const verify = localStorage.getItem("user:token");
+        return { ok: !!verify, len: verify ? verify.length : 0 };
+      } catch (e) {
+        return { ok: false, err: e.message };
+      }
+    },
+    {
+      token: LS_USER_TOKEN,
+      name: LS_USER_NAME,
+      lfp: LS_USER_LFP,
+      redirect: LS_USER_REDIRECT,
+    },
+  );
+  console.log(`[Keeper] Token inject: ok=${result.ok} len=${result.len}`);
+  return result.ok;
+}
+
+// ── Inject identity.free4talk.com tokens (different origin, needs separate page) ──
+async function injectIdentityTokens(context) {
+  try {
+    const p = await context.newPage();
+    await p.goto("https://identity.free4talk.com", {
+      waitUntil: "domcontentloaded",
+      timeout: 20000,
+    });
+    await p.evaluate(
+      ({ user, keypair }) => {
+        localStorage.setItem("user", user);
+        localStorage.setItem("key-pair", keypair);
       },
-      {
-        name: "user_name",
-        value: LS_USER_NAME || "",
-        domain: ".free4talk.com",
-        path: "/",
-        httpOnly: false,
-        secure: true,
-        sameSite: "Lax",
-      },
-    ],
-    origins: [
-      {
-        origin: "https://www.free4talk.com",
-        localStorage: [
-          { name: "user:token", value: LS_USER_TOKEN || "" },
-          { name: "user_name", value: LS_USER_NAME || "" },
-          { name: "user:lfp", value: LS_USER_LFP || "" },
-          { name: "user:redirect", value: LS_USER_REDIRECT || "" },
-        ],
-      },
-      {
-        origin: "https://identity.free4talk.com",
-        localStorage: [
-          { name: "user", value: LS_USER || "" },
-          { name: "key-pair", value: LS_KEYPAIR || "" },
-        ],
-      },
-    ],
-  };
+      { user: LS_USER, keypair: LS_KEYPAIR },
+    );
+    await p.close();
+    console.log("[Keeper] Identity tokens injected");
+    return true;
+  } catch (e) {
+    console.error(`[Keeper] Identity inject failed: ${e.message}`);
+    return false;
+  }
 }
 
 // ── Click to join room ──
 async function clickToJoin(page) {
-  // Free4Talk shows "Click on anywhere to start"
   try {
     const el = page.locator("text=Click on anywhere to start").first();
     if (await el.isVisible({ timeout: 5000 })) {
@@ -122,7 +127,6 @@ async function clickToJoin(page) {
       return true;
     }
   } catch {}
-  // Fallback: click center of page
   try {
     await page.mouse.click(400, 300);
     console.log("[Keeper] Clicked page center (fallback)");
@@ -167,6 +171,7 @@ async function safeCleanup() {
   } catch {}
   currentBrowser = null;
   currentPage = null;
+  currentContext = null;
 }
 
 // ── Main ──
@@ -199,48 +204,15 @@ async function joinRoom() {
       ],
     });
 
-    // Create context with pre-loaded auth tokens (localStorage + cookies)
-    const storageState = buildStorageState();
     const context = await currentBrowser.newContext({
       permissions: ["microphone"],
       userAgent:
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
       bypassCSP: true,
-      storageState: storageState,
     });
+    currentContext = context;
 
-    // Re-inject auth on EVERY page load (runs before SPA code)
-    await context.addInitScript(
-      ({ token, name, lfp, redirect, user, keypair }) => {
-        // www.free4talk.com tokens
-        try {
-          if (token) localStorage.setItem("user:token", token);
-          if (name) localStorage.setItem("user_name", name);
-          if (lfp) localStorage.setItem("user:lfp", lfp);
-          if (redirect) localStorage.setItem("user:redirect", redirect);
-        } catch (e) {
-          console.error("Auth inject (www) failed:", e);
-        }
-
-        // identity.free4talk.com tokens
-        try {
-          if (user) localStorage.setItem("user", user);
-          if (keypair) localStorage.setItem("key-pair", keypair);
-        } catch (e) {
-          console.error("Auth inject (identity) failed:", e);
-        }
-      },
-      {
-        token: LS_USER_TOKEN,
-        name: LS_USER_NAME,
-        lfp: LS_USER_LFP,
-        redirect: LS_USER_REDIRECT,
-        user: LS_USER,
-        keypair: LS_KEYPAIR,
-      },
-    );
-
-    // Anti-detection
+    // Anti-detection only (no auth here — auth injected via evaluate below)
     await context.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
       window.chrome = { runtime: {} };
@@ -258,15 +230,32 @@ async function joinRoom() {
       console.error(`[Keeper] Page error: ${err.message}`),
     );
 
-    console.log(`[Keeper] Navigating to ${ROOM_URL}`);
-    await page.goto(ROOM_URL, { waitUntil: "networkidle", timeout: 60000 });
-    console.log(`[Keeper] Page loaded: ${page.url()}`);
+    // ── Step 1: Navigate to room URL (domcontentloaded = fast, before SPA fully runs) ──
+    console.log(`[Keeper] Step 1: Navigate to ${ROOM_URL}`);
+    await page.goto(ROOM_URL, {
+      waitUntil: "domcontentloaded",
+      timeout: 60000,
+    });
+    console.log(`[Keeper] Page committed: ${page.url()}`);
 
-    // Wait for SPA to fully render
-    console.log("[Keeper] Waiting for page to render...");
+    // ── Step 2: Inject auth tokens DIRECTLY into localStorage ──
+    console.log("[Keeper] Step 2: Injecting www tokens...");
+    await injectTokens(page);
+
+    // ── Step 3: Inject identity tokens (separate origin) ──
+    console.log("[Keeper] Step 3: Injecting identity tokens...");
+    await injectIdentityTokens(context);
+
+    // ── Step 4: Reload page so SPA reads tokens from localStorage ──
+    console.log("[Keeper] Step 4: Reloading (SPA will read tokens now)...");
+    await page.reload({ waitUntil: "networkidle", timeout: 60000 });
+    console.log(`[Keeper] Reloaded: ${page.url()}`);
+
+    // ── Step 5: Wait for SPA to render ──
+    console.log("[Keeper] Step 5: Waiting for SPA to render...");
     await page.waitForTimeout(8000);
 
-    // Diagnostic: dump auth state
+    // ── Step 6: Verify tokens survived the reload ──
     const authCheck = await page
       .evaluate(() => {
         const token = localStorage.getItem("user:token");
@@ -274,14 +263,14 @@ async function joinRoom() {
         const lfp = localStorage.getItem("user:lfp");
         return {
           hasToken: !!token,
-          tokenPrefix: token ? token.substring(0, 30) + "..." : "NONE",
+          tokenLen: token ? token.length : 0,
           userName: name,
           hasLfp: !!lfp,
         };
       })
-      .catch(() => ({ hasToken: false, tokenPrefix: "ERROR" }));
+      .catch(() => ({ hasToken: false, tokenLen: 0, err: "evaluate-failed" }));
     console.log(
-      `[Keeper] Auth check: token=${authCheck.hasToken} (${authCheck.tokenPrefix}) name=${authCheck.userName} lfp=${authCheck.hasLfp}`,
+      `[Keeper] Auth check: token=${authCheck.hasToken} len=${authCheck.tokenLen} name=${authCheck.userName} lfp=${authCheck.hasLfp}`,
     );
 
     // Dump page text
@@ -292,7 +281,6 @@ async function joinRoom() {
       `[Keeper] Page text: "${pageText.replace(/\n/g, " ").substring(0, 200)}"`,
     );
 
-    // Check for auth failure
     if (
       pageText.toLowerCase().includes("sign in") ||
       pageText.toLowerCase().includes("please sign")
@@ -300,8 +288,15 @@ async function joinRoom() {
       console.error("[Keeper] AUTH FAILURE - page shows sign-in prompt");
     }
 
-    // Click to join
-    console.log("[Keeper] Attempting to join...");
+    // If tokens were cleared by SPA, try injecting again
+    if (!authCheck.hasToken) {
+      console.warn("[Keeper] Tokens lost after reload! Re-injecting...");
+      await injectTokens(page);
+      await page.waitForTimeout(3000);
+    }
+
+    // ── Step 7: Click to join ──
+    console.log("[Keeper] Step 7: Clicking to join...");
     await clickToJoin(page);
 
     // Wait for room connection
@@ -342,10 +337,13 @@ function startHealthChecks(page) {
       if (await isStillInRoom(page)) {
         console.log(`[Keeper] Health OK | ${elapsed()}`);
       } else {
-        console.warn("[Keeper] Unhealthy - reloading...");
+        console.warn(
+          "[Keeper] Unhealthy - re-injecting tokens and reloading...",
+        );
         clearInterval(healthInterval);
         if (page._safeInterval) clearInterval(page._safeInterval);
         try {
+          await injectTokens(page);
           await page.reload({ waitUntil: "networkidle", timeout: 60000 });
           await page.waitForTimeout(8000);
           await clickToJoin(page);
@@ -373,6 +371,7 @@ function startHealthChecks(page) {
     }
     try {
       console.log(`[Keeper] Safety reload | ${elapsed()}`);
+      await injectTokens(page);
       await page.reload({ waitUntil: "networkidle", timeout: 60000 });
       await page.waitForTimeout(8000);
       await clickToJoin(page);
@@ -411,5 +410,5 @@ process.on("unhandledRejection", async (r) => {
   if (!isShuttingDown) setTimeout(() => joinRoom(), RESTART_DELAY);
 });
 
-// ── Start bot (Express is already listening above) ──
+// ── Start bot ──
 joinRoom();
