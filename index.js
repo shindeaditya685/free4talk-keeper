@@ -1,10 +1,11 @@
-const { chromium } = require("playwright");
-const express = require("express");
 const path = require("path");
 require("dotenv").config();
 
-// Point Playwright to browsers installed in project dir (installed during build)
+// MUST be set BEFORE requiring playwright — it reads this env var at require time
 process.env.PLAYWRIGHT_BROWSERS_PATH = path.join(__dirname, "browsers");
+
+const { chromium } = require("playwright");
+const express = require("express");
 
 // ── Config ──
 const ROOM_URL = process.env.ROOM_URL || null;
@@ -30,7 +31,9 @@ let currentBrowser = null;
 // ── Express (starts IMMEDIATELY — must bind port fast for Render) ──
 const app = express();
 app.get("/", (req, res) => {
-  res.send(`<h2>Free4Talk Keeper</h2><p>Room: ${ROOM_URL}</p><p>Uptime: ${elapsed()}</p><p>Restarts: ${restartCount}</p>`);
+  res.send(
+    `<h2>Free4Talk Keeper</h2><p>Room: ${ROOM_URL}</p><p>Uptime: ${elapsed()}</p><p>Restarts: ${restartCount}</p>`,
+  );
 });
 app.listen(PORT, () => console.log(`[Server] Port ${PORT} ready`));
 
@@ -43,13 +46,23 @@ function elapsed() {
 function checkTokenExpiry() {
   try {
     const tokenObj = JSON.parse(LS_USER_TOKEN);
-    const payload = JSON.parse(Buffer.from(tokenObj.data.split(".")[1], "base64url").toString());
+    const payload = JSON.parse(
+      Buffer.from(tokenObj.data.split(".")[1], "base64url").toString(),
+    );
     const hoursLeft = (new Date(payload.exp * 1000) - new Date()) / 3600000;
-    if (hoursLeft < 0) { console.error(`[Keeper] TOKEN EXPIRED!`); return "expired"; }
-    if (hoursLeft < 2) { console.warn(`[Keeper] Token expires in ${hoursLeft.toFixed(1)}h`); return "warning"; }
+    if (hoursLeft < 0) {
+      console.error(`[Keeper] TOKEN EXPIRED!`);
+      return "expired";
+    }
+    if (hoursLeft < 2) {
+      console.warn(`[Keeper] Token expires in ${hoursLeft.toFixed(1)}h`);
+      return "warning";
+    }
     console.log(`[Keeper] Token OK - ${hoursLeft.toFixed(1)}h remaining`);
     return "ok";
-  } catch { return "unknown"; }
+  } catch {
+    return "unknown";
+  }
 }
 
 // ── Build storageState with auth tokens (tokens exist BEFORE any page loads) ──
@@ -64,7 +77,7 @@ function buildStorageState() {
         path: "/",
         httpOnly: false,
         secure: true,
-        sameSite: "Lax"
+        sameSite: "Lax",
       },
       {
         name: "user_name",
@@ -73,8 +86,8 @@ function buildStorageState() {
         path: "/",
         httpOnly: false,
         secure: true,
-        sameSite: "Lax"
-      }
+        sameSite: "Lax",
+      },
     ],
     origins: [
       {
@@ -83,17 +96,17 @@ function buildStorageState() {
           { name: "user:token", value: LS_USER_TOKEN || "" },
           { name: "user_name", value: LS_USER_NAME || "" },
           { name: "user:lfp", value: LS_USER_LFP || "" },
-          { name: "user:redirect", value: LS_USER_REDIRECT || "" }
-        ]
+          { name: "user:redirect", value: LS_USER_REDIRECT || "" },
+        ],
       },
       {
         origin: "https://identity.free4talk.com",
         localStorage: [
           { name: "user", value: LS_USER || "" },
-          { name: "key-pair", value: LS_KEYPAIR || "" }
-        ]
-      }
-    ]
+          { name: "key-pair", value: LS_KEYPAIR || "" },
+        ],
+      },
+    ],
   };
 }
 
@@ -122,20 +135,36 @@ async function clickToJoin(page) {
 // ── Health check ──
 async function isStillInRoom(page) {
   try {
-    if (page.url().includes("login") || page.url().includes("signin")) return false;
+    if (page.url().includes("login") || page.url().includes("signin"))
+      return false;
     const title = await page.title();
-    const ok = await page.evaluate(() => !!document.body && document.body.children.length > 0);
+    const ok = await page.evaluate(
+      () => !!document.body && document.body.children.length > 0,
+    );
     if (!ok || !title) return false;
-    const text = (await page.evaluate(() => document.body?.innerText?.substring(0, 2000) || "")).toLowerCase();
-    for (const kw of ["left the room", "disconnected", "reconnect", "connection lost"]) {
+    const text = (
+      await page.evaluate(
+        () => document.body?.innerText?.substring(0, 2000) || "",
+      )
+    ).toLowerCase();
+    for (const kw of [
+      "left the room",
+      "disconnected",
+      "reconnect",
+      "connection lost",
+    ]) {
       if (text.includes(kw)) return false;
     }
     return true;
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 async function safeCleanup() {
-  try { if (currentBrowser) await currentBrowser.close().catch(() => {}); } catch {}
+  try {
+    if (currentBrowser) await currentBrowser.close().catch(() => {});
+  } catch {}
   currentBrowser = null;
   currentPage = null;
 }
@@ -143,7 +172,10 @@ async function safeCleanup() {
 // ── Main ──
 async function joinRoom() {
   if (isShuttingDown) return;
-  if (restartCount >= MAX_RESTART_ATTEMPTS) { console.error("[Keeper] Max restarts reached."); return; }
+  if (restartCount >= MAX_RESTART_ATTEMPTS) {
+    console.error("[Keeper] Max restarts reached.");
+    return;
+  }
 
   restartCount++;
   console.log(`\n[Keeper] === Start #${restartCount} | ${elapsed()} ===`);
@@ -154,10 +186,16 @@ async function joinRoom() {
     currentBrowser = await chromium.launch({
       headless: true,
       args: [
-        "--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-        "--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
-        "--disable-gpu", "--disable-extensions", "--disable-software-rasterizer",
-        "--disable-features=VizDisplayCompositor", "--disable-blink-features=AutomationControlled",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--use-fake-ui-for-media-stream",
+        "--use-fake-device-for-media-stream",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--disable-software-rasterizer",
+        "--disable-features=VizDisplayCompositor",
+        "--disable-blink-features=AutomationControlled",
       ],
     });
 
@@ -165,46 +203,60 @@ async function joinRoom() {
     const storageState = buildStorageState();
     const context = await currentBrowser.newContext({
       permissions: ["microphone"],
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+      userAgent:
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
       bypassCSP: true,
       storageState: storageState,
     });
 
     // Re-inject auth on EVERY page load (runs before SPA code)
-    await context.addInitScript(({ token, name, lfp, redirect, user, keypair }) => {
-      // www.free4talk.com tokens
-      try {
-        if (token) localStorage.setItem("user:token", token);
-        if (name) localStorage.setItem("user_name", name);
-        if (lfp) localStorage.setItem("user:lfp", lfp);
-        if (redirect) localStorage.setItem("user:redirect", redirect);
-      } catch (e) { console.error("Auth inject (www) failed:", e); }
+    await context.addInitScript(
+      ({ token, name, lfp, redirect, user, keypair }) => {
+        // www.free4talk.com tokens
+        try {
+          if (token) localStorage.setItem("user:token", token);
+          if (name) localStorage.setItem("user_name", name);
+          if (lfp) localStorage.setItem("user:lfp", lfp);
+          if (redirect) localStorage.setItem("user:redirect", redirect);
+        } catch (e) {
+          console.error("Auth inject (www) failed:", e);
+        }
 
-      // identity.free4talk.com tokens
-      try {
-        if (user) localStorage.setItem("user", user);
-        if (keypair) localStorage.setItem("key-pair", keypair);
-      } catch (e) { console.error("Auth inject (identity) failed:", e); }
-    }, {
-      token: LS_USER_TOKEN,
-      name: LS_USER_NAME,
-      lfp: LS_USER_LFP,
-      redirect: LS_USER_REDIRECT,
-      user: LS_USER,
-      keypair: LS_KEYPAIR,
-    });
+        // identity.free4talk.com tokens
+        try {
+          if (user) localStorage.setItem("user", user);
+          if (keypair) localStorage.setItem("key-pair", keypair);
+        } catch (e) {
+          console.error("Auth inject (identity) failed:", e);
+        }
+      },
+      {
+        token: LS_USER_TOKEN,
+        name: LS_USER_NAME,
+        lfp: LS_USER_LFP,
+        redirect: LS_USER_REDIRECT,
+        user: LS_USER,
+        keypair: LS_KEYPAIR,
+      },
+    );
 
     // Anti-detection
     await context.addInitScript(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => false });
       window.chrome = { runtime: {} };
-      Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
+      Object.defineProperty(navigator, "plugins", {
+        get: () => [1, 2, 3, 4, 5],
+      });
+      Object.defineProperty(navigator, "languages", {
+        get: () => ["en-US", "en"],
+      });
     });
 
     const page = await context.newPage();
     currentPage = page;
-    page.on("pageerror", (err) => console.error(`[Keeper] Page error: ${err.message}`));
+    page.on("pageerror", (err) =>
+      console.error(`[Keeper] Page error: ${err.message}`),
+    );
 
     console.log(`[Keeper] Navigating to ${ROOM_URL}`);
     await page.goto(ROOM_URL, { waitUntil: "networkidle", timeout: 60000 });
@@ -215,25 +267,36 @@ async function joinRoom() {
     await page.waitForTimeout(8000);
 
     // Diagnostic: dump auth state
-    const authCheck = await page.evaluate(() => {
-      const token = localStorage.getItem("user:token");
-      const name = localStorage.getItem("user_name");
-      const lfp = localStorage.getItem("user:lfp");
-      return {
-        hasToken: !!token,
-        tokenPrefix: token ? token.substring(0, 30) + "..." : "NONE",
-        userName: name,
-        hasLfp: !!lfp
-      };
-    }).catch(() => ({ hasToken: false, tokenPrefix: "ERROR" }));
-    console.log(`[Keeper] Auth check: token=${authCheck.hasToken} (${authCheck.tokenPrefix}) name=${authCheck.userName} lfp=${authCheck.hasLfp}`);
+    const authCheck = await page
+      .evaluate(() => {
+        const token = localStorage.getItem("user:token");
+        const name = localStorage.getItem("user_name");
+        const lfp = localStorage.getItem("user:lfp");
+        return {
+          hasToken: !!token,
+          tokenPrefix: token ? token.substring(0, 30) + "..." : "NONE",
+          userName: name,
+          hasLfp: !!lfp,
+        };
+      })
+      .catch(() => ({ hasToken: false, tokenPrefix: "ERROR" }));
+    console.log(
+      `[Keeper] Auth check: token=${authCheck.hasToken} (${authCheck.tokenPrefix}) name=${authCheck.userName} lfp=${authCheck.hasLfp}`,
+    );
 
     // Dump page text
-    const pageText = await page.evaluate(() => document.body?.innerText?.substring(0, 800) || "");
-    console.log(`[Keeper] Page text: "${pageText.replace(/\n/g, ' ').substring(0, 200)}"`);
+    const pageText = await page.evaluate(
+      () => document.body?.innerText?.substring(0, 800) || "",
+    );
+    console.log(
+      `[Keeper] Page text: "${pageText.replace(/\n/g, " ").substring(0, 200)}"`,
+    );
 
     // Check for auth failure
-    if (pageText.toLowerCase().includes("sign in") || pageText.toLowerCase().includes("please sign")) {
+    if (
+      pageText.toLowerCase().includes("sign in") ||
+      pageText.toLowerCase().includes("please sign")
+    ) {
       console.error("[Keeper] AUTH FAILURE - page shows sign-in prompt");
     }
 
@@ -244,8 +307,12 @@ async function joinRoom() {
     // Wait for room connection
     await page.waitForTimeout(10000);
 
-    const finalText = await page.evaluate(() => document.body?.innerText?.substring(0, 800) || "");
-    console.log(`[Keeper] After join: "${finalText.replace(/\n/g, ' ').substring(0, 200)}"`);
+    const finalText = await page.evaluate(
+      () => document.body?.innerText?.substring(0, 800) || "",
+    );
+    console.log(
+      `[Keeper] After join: "${finalText.replace(/\n/g, " ").substring(0, 200)}"`,
+    );
 
     if (page.url().includes("login") || page.url().includes("signin")) {
       console.error("[Keeper] Redirected to login!");
@@ -257,7 +324,6 @@ async function joinRoom() {
 
     // Health check loop
     startHealthChecks(page);
-
   } catch (err) {
     console.error(`[Keeper] Fatal: ${err.message}`);
     await safeCleanup();
@@ -267,13 +333,18 @@ async function joinRoom() {
 
 function startHealthChecks(page) {
   const healthInterval = setInterval(async () => {
-    if (isShuttingDown) { clearInterval(healthInterval); if (page._safeInterval) clearInterval(page._safeInterval); return; }
+    if (isShuttingDown) {
+      clearInterval(healthInterval);
+      if (page._safeInterval) clearInterval(page._safeInterval);
+      return;
+    }
     try {
       if (await isStillInRoom(page)) {
         console.log(`[Keeper] Health OK | ${elapsed()}`);
       } else {
         console.warn("[Keeper] Unhealthy - reloading...");
-        clearInterval(healthInterval); if (page._safeInterval) clearInterval(page._safeInterval);
+        clearInterval(healthInterval);
+        if (page._safeInterval) clearInterval(page._safeInterval);
         try {
           await page.reload({ waitUntil: "networkidle", timeout: 60000 });
           await page.waitForTimeout(8000);
@@ -288,21 +359,26 @@ function startHealthChecks(page) {
         }
       }
     } catch (err) {
-      clearInterval(healthInterval); if (page._safeInterval) clearInterval(page._safeInterval);
+      clearInterval(healthInterval);
+      if (page._safeInterval) clearInterval(page._safeInterval);
       await safeCleanup();
       setTimeout(() => joinRoom(), RESTART_DELAY);
     }
   }, HEALTH_CHECK_INTERVAL);
 
   const safeInterval = setInterval(async () => {
-    if (isShuttingDown) { clearInterval(safeInterval); return; }
+    if (isShuttingDown) {
+      clearInterval(safeInterval);
+      return;
+    }
     try {
       console.log(`[Keeper] Safety reload | ${elapsed()}`);
       await page.reload({ waitUntil: "networkidle", timeout: 60000 });
       await page.waitForTimeout(8000);
       await clickToJoin(page);
     } catch (err) {
-      clearInterval(healthInterval); clearInterval(safeInterval);
+      clearInterval(healthInterval);
+      clearInterval(safeInterval);
       await safeCleanup();
       setTimeout(() => joinRoom(), RESTART_DELAY);
     }
@@ -313,10 +389,27 @@ function startHealthChecks(page) {
 }
 
 // ── Graceful shutdown ──
-process.on("SIGINT", async () => { isShuttingDown = true; console.log(`Shutting down. ${elapsed()}`); await safeCleanup(); process.exit(0); });
-process.on("SIGTERM", async () => { isShuttingDown = true; await safeCleanup(); process.exit(0); });
-process.on("uncaughtException", async (err) => { console.error(`Crash: ${err.message}`); await safeCleanup(); if (!isShuttingDown) setTimeout(() => joinRoom(), RESTART_DELAY); });
-process.on("unhandledRejection", async (r) => { console.error(`Crash: ${r}`); await safeCleanup(); if (!isShuttingDown) setTimeout(() => joinRoom(), RESTART_DELAY); });
+process.on("SIGINT", async () => {
+  isShuttingDown = true;
+  console.log(`Shutting down. ${elapsed()}`);
+  await safeCleanup();
+  process.exit(0);
+});
+process.on("SIGTERM", async () => {
+  isShuttingDown = true;
+  await safeCleanup();
+  process.exit(0);
+});
+process.on("uncaughtException", async (err) => {
+  console.error(`Crash: ${err.message}`);
+  await safeCleanup();
+  if (!isShuttingDown) setTimeout(() => joinRoom(), RESTART_DELAY);
+});
+process.on("unhandledRejection", async (r) => {
+  console.error(`Crash: ${r}`);
+  await safeCleanup();
+  if (!isShuttingDown) setTimeout(() => joinRoom(), RESTART_DELAY);
+});
 
 // ── Start bot (Express is already listening above) ──
 joinRoom();
